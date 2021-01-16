@@ -2,6 +2,7 @@ print('importing...')
 import pyaudio
 from time import time, sleep
 import numpy as np
+from scipy import stats
 from threading import Lock
 from collections import namedtuple
 from interactive import listen
@@ -14,11 +15,11 @@ except ImportError:
 
 print('Preparing...')
 FRAME_LEN = 1024
-EXAMPLE_N_FRAME = 10
-STABILITY_THRESHOLD = ...
+EXAMPLE_N_FRAME = 13
+STABILITY_THRESHOLD = -.1
 MIN_PITCH_DIFF = 1
-MAIN_VOICE_THRU = False
-CROSS_FADE = 0.04
+MAIN_VOICE_THRU = True
+CROSS_FADE = 0.9
 PEDAL_DOWN = b'l'
 PEDAL_UP = b'p'
 
@@ -49,6 +50,7 @@ def main():
     global terminate_flag, sustaining
     print(f'Press {PEDAL_DOWN.decode()} to sustain. ')
     print(f'Press {PEDAL_UP  .decode()} to release. ')
+    print('Press ESC to quit. ')
     terminateLock.acquire()
     pa = pyaudio.PyAudio()
     streamOutContainer.append(pa.open(
@@ -63,7 +65,7 @@ def main():
     streamIn.start_stream()
     try:
         while streamIn.is_active():
-            op = listen((b'\x1b', PEDAL_DOWN, PEDAL_UP), 2)
+            op = listen((b'\x1b', PEDAL_DOWN, PEDAL_UP), 2, priorize_esc_or_arrow=True)
             if op is None:
                 continue
             if op == b'\x1b':
@@ -80,7 +82,8 @@ def main():
         terminateLock.release()
         streamOutContainer[0].stop_stream()
         streamOutContainer[0].close()
-        sleep(.4)   # not perfect
+        while streamIn.is_active():
+            sleep(.1)   # not perfect
         streamIn.stop_stream()
         streamIn.close()
         pa.terminate()
@@ -95,9 +98,10 @@ class Tone:
         self.playhead = 0
     
     def go(self):
+        self.do_go = True
         # stitch
-        sacrifice = self.examples.pop(-1)
-        mutator = self.examples[0]
+        sacrifice = self.examples.pop(-1).frame
+        mutator = self.examples[0].frame.copy()
         patch = np.multiply(
             sacrifice[:CROSS_FADE_N_SAMPLE], 
             FADE_OUT_WINDOW,
@@ -107,11 +111,13 @@ class Tone:
             FADE_IN_WINDOW, 
         )
         mutator[:CROSS_FADE_N_SAMPLE] = patch
-        self.do_go = True
+        self.examples[0] = PitchFrame(None, mutator)
 
 def summarize(list_PitchFrame):
     pitches = np.array([x.pitch for x in list_PitchFrame])
-    return np.mean(pitches), np.var(pitches, ddof = 1)
+    slope, _, __, ___, _ = stats.linregress(np.arange(pitches.size), pitches)
+    return np.mean(pitches), - abs(slope) / FRAME_TIME
+    # return np.mean(pitches), np.var(pitches, ddof = 1)
 
 def onAudioIn(in_data, sample_count, *_):
     global display_time, time_start, terminate_flag
@@ -120,7 +126,8 @@ def onAudioIn(in_data, sample_count, *_):
         if terminate_flag == 1:
             terminate_flag = 2
             terminateLock.release()
-            print('PA handler terminated.')
+            print('PA handler terminating. ')
+            # Sadly, there is no way to notify main thread after returning. 
             return (None, pyaudio.paComplete)
 
         if sample_count > FRAME_LEN:
@@ -144,12 +151,12 @@ def onAudioIn(in_data, sample_count, *_):
         if sustaining:
             for tone in tones:
                 if tone.do_go:
-                    mix.append(tone.examples[tone.playhead])
+                    mix.append(tone.examples[tone.playhead].frame)
                     tone.playhead = (tone.playhead + 1) % EXAMPLE_N_FRAME
         if MAIN_VOICE_THRU:
             mix.append(frame)
         if mix:
-            frame_out = np.sum(mix)
+            frame_out = np.sum(mix, 0)
         else:
             frame_out = SILENCE
         mix_time = time() - time_start
@@ -176,7 +183,7 @@ def onAudioIn(in_data, sample_count, *_):
 
 def consume(frame):
     if not sustaining:
-        return
+        stm.clear()
     f0 = yin(frame, SR, FRAME_LEN)
     # fresh_pitch = np.log(f0) * 17.312340490667562 - 36.37631656229591
     fresh_pitch = np.log(f0) * 17.312340490667562
@@ -187,19 +194,21 @@ def consume(frame):
         return
     if len(stm) == EXAMPLE_N_FRAME + 2:
         stm.pop(0)
-    pitch, variance = summarize(stm)
-    stability = - variance
-    print(stability)
-    if tones[-1].do_go:
+    pitch, stability = summarize(stm)
+    # print(stability)
+    if not tones or tones[-1].do_go:
         # ready for a new tone
         if stability > STABILITY_THRESHOLD:
+            print('New tone, stability', stability)
             tones.append(Tone(pitch, stability, stm))
     else:
         # last tone not going yet
         if abs(pitch - tones[-1].pitch) > MIN_PITCH_DIFF:
+            print('Tone goes!')
             tones[-1].go()
         else:
             if stability >= tones[-1].stability:
+                print('Better tone, stability', stability)
                 tones[-1] = Tone(pitch, stability, stm)
 
 TIMES = [
