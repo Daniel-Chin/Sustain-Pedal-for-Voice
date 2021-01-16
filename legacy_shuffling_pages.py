@@ -2,7 +2,6 @@ print('importing...')
 import pyaudio
 from time import time, sleep
 import numpy as np
-import scipy
 from scipy import stats
 from threading import Lock
 from collections import namedtuple
@@ -10,7 +9,6 @@ from interactive import listen
 try:
     from yin import yin
     from streamProfiler import StreamProfiler
-    from harmonicSynth import HarmonicSynth, Harmonic
 except ImportError as e:
     module_name = str(e).split('No module named ', 1)[1].strip().strip('"\'')
     print(f'Missing module {module_name}. Please download at')
@@ -20,41 +18,36 @@ except ImportError as e:
 
 print('Preparing...')
 PAGE_LEN = 1024
-EXAMPLE_N_PAGE = 12
-STABILITY_THRESHOLD = -.2
+EXAMPLE_N_PAGE = 13
+STABILITY_THRESHOLD = -.1
 MIN_PITCH_DIFF = 1
 MAIN_VOICE_THRU = True
-N_HARMONICS = 60
-DO_SWIPE = False
-
-WRITE_FILE = None
-# import random
-# WRITE_FILE = f'demo.wav'
-
+CROSS_FADE = 0.9
 PEDAL_DOWN = b'l'
 PEDAL_UP = b'p'
-SR = 22050
+
+SR = 44100
 DTYPE = (np.float32, pyaudio.paFloat32)
-TWO_PI = np.pi * 2
-HANN = scipy.signal.get_window('hann', PAGE_LEN, True)
-SILENCE = np.zeros((PAGE_LEN, ))
+
 PAGE_TIME = 1 / SR * PAGE_LEN
-LONG_PAGE_LEN = PAGE_LEN * EXAMPLE_N_PAGE
-LONG_IMAGINARY_LADDER = np.linspace(0, TWO_PI * 1j, LONG_PAGE_LEN)
+CROSS_FADE_N_SAMPLE = round(CROSS_FADE * PAGE_LEN)
+FADE_IN_WINDOW = np.array([
+    x / CROSS_FADE_N_SAMPLE for x in range(CROSS_FADE_N_SAMPLE)
+], DTYPE[0])
+FADE_OUT_WINDOW = np.flip(FADE_IN_WINDOW)
+SILENCE = np.zeros((PAGE_LEN, ))
+
+PitchPage = namedtuple('PitchPage', ('pitch', 'page'))
 
 streamOutContainer = []
+display_time = 0
+time_start = 0
 terminate_flag = 0
 terminateLock = Lock()
-tones = []
-profiler = StreamProfiler(PAGE_LEN / SR)
-sustaining = False  # So don't put a lock if you dont need it
-stm_pitch = []
-stm_page = []
-# Short Term Memory. Len is EXAMPLE_N_PAGE
 
-def sft(signal, freq_bin):
-    # Slow Fourier Transform
-    return np.abs(np.sum(signal * np.exp(LONG_IMAGINARY_LADDER * freq_bin))) / LONG_PAGE_LEN
+sustaining = False  # So don't put a lock if you dont need it
+tones = []
+stm = []   # Short Term Memory. Len is 1 + EXAMPLE_N_PAGE
 
 def main():
     global terminate_flag, sustaining
@@ -99,8 +92,32 @@ def main():
         pa.terminate()
         print('Resources released. ')
 
-def summarize(list_pitch):
-    pitches = np.array(list_pitch)
+class Tone:
+    def __init__(self, pitch, stability, stm):
+        self.pitch = pitch
+        self.examples = stm[:]
+        self.stability = stability
+        self.do_go = False
+        self.playhead = 0
+    
+    def go(self):
+        self.do_go = True
+        # stitch
+        sacrifice = self.examples.pop(-1).page
+        mutator = self.examples[0].page.copy()
+        patch = np.multiply(
+            sacrifice[:CROSS_FADE_N_SAMPLE], 
+            FADE_OUT_WINDOW,
+        )
+        patch += np.multiply(
+            mutator[:CROSS_FADE_N_SAMPLE], 
+            FADE_IN_WINDOW, 
+        )
+        mutator[:CROSS_FADE_N_SAMPLE] = patch
+        self.examples[0] = PitchPage(None, mutator)
+
+def summarize(list_PitchPage):
+    pitches = np.array([x.pitch for x in list_PitchPage])
     slope, _, __, ___, _ = stats.linregress(np.arange(pitches.size), pitches)
     return np.mean(pitches), - abs(slope) / PAGE_TIME
     # return np.mean(pitches), np.var(pitches, ddof = 1)
@@ -117,33 +134,49 @@ def onAudioIn(in_data, sample_count, *_):
             return (None, pyaudio.paComplete)
 
         if sample_count > PAGE_LEN:
-            print('Discarding audio page!')
-            in_data = in_data[-PAGE_LEN:]
+            onAudioIn(in_data[:PAGE_LEN], PAGE_LEN)
+            onAudioIn(in_data[PAGE_LEN:], sample_count - PAGE_LEN)
 
-        profiler.gonna('hann')
+        idle_time = time() - time_start
+
+        time_start = time()
         page = np.frombuffer(
             in_data, dtype = DTYPE[0]
         )
-        hanned_page = HANN * page
+        typing_time = time() - time_start
 
-        profiler.gonna('consume')
-        consume(page, hanned_page)
+        time_start = time()
+        consume(page)
+        consume_time = time() - time_start
 
-        profiler.gonna('eat')
-        [t.loop() for t in tones]
-
-        profiler.gonna('mix')
-        to_mix = [t.mix() for t in tones]
+        time_start = time()
+        mix = []
+        if sustaining:
+            for tone in tones:
+                if tone.do_go:
+                    mix.append(tone.examples[tone.playhead].page)
+                    tone.playhead = (tone.playhead + 1) % EXAMPLE_N_PAGE
         if MAIN_VOICE_THRU:
-            to_mix.append(page)
-        if to_mix:
-            mixed = np.sum(to_mix, 0)
+            mix.append(page)
+        if mix:
+            page_out = np.sum(mix, 0)
         else:
-            mixed = SILENCE
-        streamOutContainer[0].write(mixed, PAGE_LEN)
+            page_out = SILENCE
+        mix_time = time() - time_start
 
-        profiler.display(same_line=True)
-        profiler.gonna('idle')
+        time_start = time()
+        streamOutContainer[0].write(page_out, PAGE_LEN)
+        write_time = time() - time_start
+
+        time_start = time()
+        display(
+            write_time, typing_time, consume_time, mix_time, 
+            display_time, 
+            idle_time, 
+        )
+        display_time = time() - time_start
+
+        time_start = time()
         return (None, pyaudio.paContinue)
     except:
         terminateLock.release()
@@ -151,28 +184,26 @@ def onAudioIn(in_data, sample_count, *_):
         traceback.print_exc()
         return (None, pyaudio.paAbort)
 
-def consume(page, hanned_page):
+def consume(page):
     if not sustaining:
-        stm_page.clear()
-        stm_pitch.clear()
+        stm.clear()
     f0 = yin(page, SR, PAGE_LEN)
     # fresh_pitch = np.log(f0) * 17.312340490667562 - 36.37631656229591
     fresh_pitch = np.log(f0) * 17.312340490667562
-    stm_pitch.append(fresh_pitch)
-    stm_page.append(page)
-    if len(stm_pitch) < EXAMPLE_N_PAGE:
+    pf = PitchPage(fresh_pitch, page)
+    stm.append(pf)
+    if len(stm) <= EXAMPLE_N_PAGE:
         tones.clear()
         return
-    if len(stm_pitch) == EXAMPLE_N_PAGE + 1:
-        stm_pitch.pop(0)
-        stm_page.pop(0)
-    pitch, stability = summarize(stm_pitch)
+    if len(stm) == EXAMPLE_N_PAGE + 2:
+        stm.pop(0)
+    pitch, stability = summarize(stm)
     # print(stability)
     if not tones or tones[-1].do_go:
         # ready for a new tone
         if stability > STABILITY_THRESHOLD:
             print('New tone, stability', stability)
-            tones.append(Tone(pitch, stability, stm_page))
+            tones.append(Tone(pitch, stability, stm))
     else:
         # last tone not going yet
         if abs(pitch - tones[-1].pitch) > MIN_PITCH_DIFF:
@@ -181,40 +212,20 @@ def consume(page, hanned_page):
         else:
             if stability >= tones[-1].stability:
                 print('Better tone, stability', stability)
-                tones[-1] = Tone(pitch, stability, stm_page)
+                tones[-1] = Tone(pitch, stability, stm)
 
-class Tone(HarmonicSynth):
-    def __init__(self, pitch, stability, pages):
-        super().__init__(
-            N_HARMONICS, SR, PAGE_LEN, DTYPE[0], True, 
-            DO_SWIPE, .3, 
-        )
-        self.do_go = False
-        self.pitch = pitch
-        self.stability = stability
-        self.imitate(pitch, pages)
-
-    def imitate(self, pitch, pages):
-        freq = np.exp(pitch * 0.05776226504666211)
-        long_page = np.concatenate(pages)
-        self.ground_harmonics = [
-            Harmonic(freq * i, 0)
-            for i in range(1, 1 + N_HARMONICS)
-        ]
-        self.planned_harmonics = [
-            Harmonic(
-                f, 
-                sft(long_page, f * LONG_PAGE_LEN / SR), 
-            )
-            for f in self.ground_harmonics
-        ]
-    
-    def go(self):
-        self.do_go = True
-        self.eat(self.ground_harmonics)
-    
-    def loop(self):
-        if self.do_go:
-            self.eat(self.planned_harmonics)
+TIMES = [
+    'typing_time', 'consume_time', 'mix_time', 
+    'write_time', 
+    'display_time', 'idle_time',
+]
+def display(
+    write_time, typing_time, consume_time, mix_time, 
+    display_time, 
+    idle_time, 
+):
+    return
+    _locals = locals()
+    print('', *[x[:-5] + ' {:4.0%}.    '.format(_locals[x] / PAGE_TIME) for x in TIMES])
 
 main()
