@@ -8,14 +8,17 @@ from collections import namedtuple
 from interactive import listen
 try:
     from yin import yin
-except ImportError:
-    print('Missing module "yin". Please download at')
-    print('https://github.com/Daniel-Chin/Python_Lib/blob/master/yin.py')
+    from streamProfiler import StreamProfiler
+except ImportError as e:
+    module_name = str(e).split('No module named ', 1)[1].strip().strip('"\'')
+    print(f'Missing module {module_name}. Please download at')
+    print(f'https://github.com/Daniel-Chin/Python_Lib/blob/master/{module_name}.py')
     input('Press Enter to quit...')
+    raise e
 
 print('Preparing...')
-FRAME_LEN = 1024
-EXAMPLE_N_FRAME = 13
+PAGE_LEN = 1024
+EXAMPLE_N_PAGE = 13
 STABILITY_THRESHOLD = -.1
 MIN_PITCH_DIFF = 1
 MAIN_VOICE_THRU = True
@@ -26,15 +29,15 @@ PEDAL_UP = b'p'
 SR = 44100
 DTYPE = (np.float32, pyaudio.paFloat32)
 
-FRAME_TIME = 1 / SR * FRAME_LEN
-CROSS_FADE_N_SAMPLE = round(CROSS_FADE * FRAME_LEN)
+PAGE_TIME = 1 / SR * PAGE_LEN
+CROSS_FADE_N_SAMPLE = round(CROSS_FADE * PAGE_LEN)
 FADE_IN_WINDOW = np.array([
     x / CROSS_FADE_N_SAMPLE for x in range(CROSS_FADE_N_SAMPLE)
 ], DTYPE[0])
 FADE_OUT_WINDOW = np.flip(FADE_IN_WINDOW)
-SILENCE = np.zeros((FRAME_LEN, ))
+SILENCE = np.zeros((PAGE_LEN, ))
 
-PitchFrame = namedtuple('PitchFrame', ('pitch', 'frame'))
+PitchPage = namedtuple('PitchPage', ('pitch', 'page'))
 
 streamOutContainer = []
 display_time = 0
@@ -44,7 +47,7 @@ terminateLock = Lock()
 
 sustaining = False  # So don't put a lock if you dont need it
 tones = []
-stm = []   # Short Term Memory. Len is 1 + EXAMPLE_N_FRAME
+stm = []   # Short Term Memory. Len is 1 + EXAMPLE_N_PAGE
 
 def main():
     global terminate_flag, sustaining
@@ -55,11 +58,11 @@ def main():
     pa = pyaudio.PyAudio()
     streamOutContainer.append(pa.open(
         format = DTYPE[1], channels = 1, rate = SR, 
-        output = True, frames_per_buffer = FRAME_LEN,
+        output = True, pages_per_buffer = PAGE_LEN,
     ))
     streamIn = pa.open(
         format = DTYPE[1], channels = 1, rate = SR, 
-        input = True, frames_per_buffer = FRAME_LEN,
+        input = True, pages_per_buffer = PAGE_LEN,
         stream_callback = onAudioIn, 
     )
     streamIn.start_stream()
@@ -100,8 +103,8 @@ class Tone:
     def go(self):
         self.do_go = True
         # stitch
-        sacrifice = self.examples.pop(-1).frame
-        mutator = self.examples[0].frame.copy()
+        sacrifice = self.examples.pop(-1).page
+        mutator = self.examples[0].page.copy()
         patch = np.multiply(
             sacrifice[:CROSS_FADE_N_SAMPLE], 
             FADE_OUT_WINDOW,
@@ -111,12 +114,12 @@ class Tone:
             FADE_IN_WINDOW, 
         )
         mutator[:CROSS_FADE_N_SAMPLE] = patch
-        self.examples[0] = PitchFrame(None, mutator)
+        self.examples[0] = PitchPage(None, mutator)
 
-def summarize(list_PitchFrame):
-    pitches = np.array([x.pitch for x in list_PitchFrame])
+def summarize(list_PitchPage):
+    pitches = np.array([x.pitch for x in list_PitchPage])
     slope, _, __, ___, _ = stats.linregress(np.arange(pitches.size), pitches)
-    return np.mean(pitches), - abs(slope) / FRAME_TIME
+    return np.mean(pitches), - abs(slope) / PAGE_TIME
     # return np.mean(pitches), np.var(pitches, ddof = 1)
 
 def onAudioIn(in_data, sample_count, *_):
@@ -130,20 +133,20 @@ def onAudioIn(in_data, sample_count, *_):
             # Sadly, there is no way to notify main thread after returning. 
             return (None, pyaudio.paComplete)
 
-        if sample_count > FRAME_LEN:
-            onAudioIn(in_data[:FRAME_LEN], FRAME_LEN)
-            onAudioIn(in_data[FRAME_LEN:], sample_count - FRAME_LEN)
+        if sample_count > PAGE_LEN:
+            onAudioIn(in_data[:PAGE_LEN], PAGE_LEN)
+            onAudioIn(in_data[PAGE_LEN:], sample_count - PAGE_LEN)
 
         idle_time = time() - time_start
 
         time_start = time()
-        frame = np.frombuffer(
+        page = np.frombuffer(
             in_data, dtype = DTYPE[0]
         )
         typing_time = time() - time_start
 
         time_start = time()
-        consume(frame)
+        consume(page)
         consume_time = time() - time_start
 
         time_start = time()
@@ -151,18 +154,18 @@ def onAudioIn(in_data, sample_count, *_):
         if sustaining:
             for tone in tones:
                 if tone.do_go:
-                    mix.append(tone.examples[tone.playhead].frame)
-                    tone.playhead = (tone.playhead + 1) % EXAMPLE_N_FRAME
+                    mix.append(tone.examples[tone.playhead].page)
+                    tone.playhead = (tone.playhead + 1) % EXAMPLE_N_PAGE
         if MAIN_VOICE_THRU:
-            mix.append(frame)
+            mix.append(page)
         if mix:
-            frame_out = np.sum(mix, 0)
+            page_out = np.sum(mix, 0)
         else:
-            frame_out = SILENCE
+            page_out = SILENCE
         mix_time = time() - time_start
 
         time_start = time()
-        streamOutContainer[0].write(frame_out, FRAME_LEN)
+        streamOutContainer[0].write(page_out, PAGE_LEN)
         write_time = time() - time_start
 
         time_start = time()
@@ -181,18 +184,18 @@ def onAudioIn(in_data, sample_count, *_):
         traceback.print_exc()
         return (None, pyaudio.paAbort)
 
-def consume(frame):
+def consume(page):
     if not sustaining:
         stm.clear()
-    f0 = yin(frame, SR, FRAME_LEN)
+    f0 = yin(page, SR, PAGE_LEN)
     # fresh_pitch = np.log(f0) * 17.312340490667562 - 36.37631656229591
     fresh_pitch = np.log(f0) * 17.312340490667562
-    pf = PitchFrame(fresh_pitch, frame)
+    pf = PitchPage(fresh_pitch, page)
     stm.append(pf)
-    if len(stm) <= EXAMPLE_N_FRAME:
+    if len(stm) <= EXAMPLE_N_PAGE:
         tones.clear()
         return
-    if len(stm) == EXAMPLE_N_FRAME + 2:
+    if len(stm) == EXAMPLE_N_PAGE + 2:
         stm.pop(0)
     pitch, stability = summarize(stm)
     # print(stability)
@@ -223,6 +226,6 @@ def display(
 ):
     return
     _locals = locals()
-    print('', *[x[:-5] + ' {:4.0%}.    '.format(_locals[x] / FRAME_TIME) for x in TIMES])
+    print('', *[x[:-5] + ' {:4.0%}.    '.format(_locals[x] / PAGE_TIME) for x in TIMES])
 
 main()
