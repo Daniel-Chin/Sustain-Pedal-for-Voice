@@ -6,8 +6,9 @@ import scipy
 from scipy import stats
 from threading import Lock
 from collections import namedtuple
-from interactive import listen
+import wave
 try:
+    from interactive import listen
     from yin import yin
     from streamProfiler import StreamProfiler
     from harmonicSynth import HarmonicSynth, Harmonic
@@ -23,21 +24,23 @@ PAGE_LEN = 1024
 TRACK_N_PAGE = 6
 EXAMPLE_N_PAGE = 4
 # STABILITY_THRESHOLD = -.3
-STABILITY_THRESHOLD = -.02
+STABILITY_THRESHOLD = -.03
 MIN_PITCH_DIFF = 1
-MAIN_VOICE_THRU = False
+MAIN_VOICE_THRU = True
 N_HARMONICS = 60
 DO_SWIPE = False
+FADE_IN = .1    # seconds
+DO_PROFILE = True
+PEDAL_DELAY = .4
 
-WRITE_FILE = None
-# import random
-# WRITE_FILE = f'demo.wav'
-DO_PROFILE = False
+# WRITE_FILE = None
+import random
+WRITE_FILE = f'bohe_{random.randint(0, 99999)}.wav'
 
 PEDAL_DOWN = b'l'
-PEDAL_UP = b'p'
+# PEDAL_UP = b'p'
 SR = 22050
-DTYPE = (np.float32, pyaudio.paFloat32)
+DTYPE = (np.int32, pyaudio.paInt32)
 TWO_PI = np.pi * 2
 HANN = scipy.signal.get_window('hann', PAGE_LEN, True)
 SILENCE = np.zeros((PAGE_LEN, ))
@@ -45,6 +48,7 @@ PAGE_TIME = 1 / SR * PAGE_LEN
 LONG_PAGE_LEN = PAGE_LEN * EXAMPLE_N_PAGE
 LONG_IMAGINARY_LADDER = np.linspace(0, TWO_PI * 1j, LONG_PAGE_LEN)
 LONG_HANN = scipy.signal.get_window('hann', LONG_PAGE_LEN, True)
+FADE_IN_PER_PAGE = PAGE_TIME / FADE_IN
 
 streamOutContainer = []
 terminate_flag = 0
@@ -54,6 +58,7 @@ profiler = StreamProfiler(PAGE_LEN / SR, DO_PROFILE)
 sustaining = False  # So don't put a lock if you dont need it
 stm_pitch = []
 stm_page = []
+last_pedal = 0
 # Short Term Memory. Len is TRACK_N_PAGE
 
 def summarize(list_pitch):
@@ -73,16 +78,22 @@ def sft(signal, freq_bin):
     return np.abs(np.sum(signal * np.exp(LONG_IMAGINARY_LADDER * freq_bin))) / LONG_PAGE_LEN
 
 def main():
-    global terminate_flag, sustaining
-    print(f'Press {PEDAL_DOWN.decode()} to sustain. ')
-    print(f'Press {PEDAL_UP  .decode()} to release. ')
+    global terminate_flag, sustaining, f, last_pedal
+    print(f'Hold {PEDAL_DOWN.decode()} to sustain. ')
+    # print(f'Press {PEDAL_UP  .decode()} to release. ')
     print('Press ESC to quit. ')
     terminateLock.acquire()
     pa = pyaudio.PyAudio()
-    streamOutContainer.append(pa.open(
-        format = DTYPE[1], channels = 1, rate = SR, 
-        output = True, frames_per_buffer = PAGE_LEN,
-    ))
+    if WRITE_FILE is None:
+        streamOutContainer.append(pa.open(
+            format = DTYPE[1], channels = 1, rate = SR, 
+            output = True, frames_per_buffer = PAGE_LEN,
+        ))
+    else:
+        f = wave.open(WRITE_FILE, 'wb')
+        f.setnchannels(1)
+        f.setsampwidth(4)
+        f.setframerate(SR)
     streamIn = pa.open(
         format = DTYPE[1], channels = 1, rate = SR, 
         input = True, frames_per_buffer = PAGE_LEN,
@@ -91,14 +102,22 @@ def main():
     streamIn.start_stream()
     try:
         while streamIn.is_active():
-            op = listen((b'\x1b', PEDAL_DOWN, PEDAL_UP), 2, priorize_esc_or_arrow=True)
-            if op is None:
-                continue
+            op = listen((b'\x1b', PEDAL_DOWN), PEDAL_DELAY, priorize_esc_or_arrow=True)
             if op == b'\x1b':
                 print('Esc received. Shutting down. ')
                 break
-            sustaining = op == PEDAL_DOWN
-            print(sustaining)
+            if sustaining:
+                if op is None:
+                    if time() - last_pedal > PEDAL_DELAY:
+                        sustaining = False
+                        print('Pedal up!')
+                else:
+                    last_pedal = max(time(), last_pedal)
+            else:
+                if op == PEDAL_DOWN:
+                    sustaining = True
+                    last_pedal = time() + .7
+                    print('Pedal down!')
     except KeyboardInterrupt:
         print('Ctrl+C received. Shutting down. ')
     finally:
@@ -106,8 +125,11 @@ def main():
         terminate_flag = 1
         terminateLock.acquire()
         terminateLock.release()
-        streamOutContainer[0].stop_stream()
-        streamOutContainer[0].close()
+        if WRITE_FILE is None:
+            streamOutContainer[0].stop_stream()
+            streamOutContainer[0].close()
+        else:
+            f.close()
         while streamIn.is_active():
             sleep(.1)   # not perfect
         streamIn.stop_stream()
@@ -148,7 +170,10 @@ def onAudioIn(in_data, sample_count, *_):
             mixed = np.sum(to_mix, 0)
         else:
             mixed = SILENCE
-        streamOutContainer[0].write(mixed, PAGE_LEN)
+        if WRITE_FILE is None:
+            streamOutContainer[0].write(mixed, PAGE_LEN)
+        else:
+            f.writeframes(mixed)
 
         profiler.display(same_line=True)
         profiler.gonna('idle')
@@ -211,6 +236,7 @@ class Tone(HarmonicSynth):
         self.pitch = pitch
         self.stability = stability
         self.imitate(pitch, pages[:EXAMPLE_N_PAGE])
+        self.master_volume = 0
 
     def imitate(self, pitch, pages):
         profiler.gonna('concat')
@@ -232,10 +258,14 @@ class Tone(HarmonicSynth):
     def go(self):
         profiler.gonna('go')
         self.do_go = True
-        self.eat(self.ground_harmonics)
+        self.loop()
     
     def loop(self):
         if self.do_go:
-            self.eat(self.planned_harmonics)
+            self.eat([
+                Harmonic(f, m * self.master_volume) 
+                for f, m in self.planned_harmonics
+            ])
+            self.master_volume = min(self.master_volume + FADE_IN_PER_PAGE, 1)
 
 main()
