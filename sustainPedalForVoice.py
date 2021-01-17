@@ -36,6 +36,7 @@ PEDAL_DELAY = .4
 # WRITE_FILE = None
 import random
 WRITE_FILE = f'bohe_{random.randint(0, 99999)}.wav'
+REALTIME_FEEDBACK = True
 
 PEDAL_DOWN = b'l'
 # PEDAL_UP = b'p'
@@ -84,12 +85,12 @@ def main():
     print('Press ESC to quit. ')
     terminateLock.acquire()
     pa = pyaudio.PyAudio()
-    if WRITE_FILE is None:
+    if REALTIME_FEEDBACK:
         streamOutContainer.append(pa.open(
             format = DTYPE[1], channels = 1, rate = SR, 
             output = True, frames_per_buffer = PAGE_LEN,
         ))
-    else:
+    if WRITE_FILE is not None:
         f = wave.open(WRITE_FILE, 'wb')
         f.setnchannels(1)
         f.setsampwidth(4)
@@ -125,10 +126,10 @@ def main():
         terminate_flag = 1
         terminateLock.acquire()
         terminateLock.release()
-        if WRITE_FILE is None:
+        if REALTIME_FEEDBACK:
             streamOutContainer[0].stop_stream()
             streamOutContainer[0].close()
-        else:
+        if WRITE_FILE is not None:
             f.close()
         while streamIn.is_active():
             sleep(.1)   # not perfect
@@ -170,9 +171,9 @@ def onAudioIn(in_data, sample_count, *_):
             mixed = np.sum(to_mix, 0)
         else:
             mixed = SILENCE
-        if WRITE_FILE is None:
+        if REALTIME_FEEDBACK:
             streamOutContainer[0].write(mixed, PAGE_LEN)
-        else:
+        if WRITE_FILE is not None:
             f.writeframes(mixed)
 
         profiler.display(same_line=True)
