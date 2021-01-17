@@ -24,18 +24,17 @@ print('Preparing...')
 PAGE_LEN = 1024
 TRACK_N_PAGE = 6
 EXAMPLE_N_PAGE = 4
-# STABILITY_THRESHOLD = -.3
 STABILITY_THRESHOLD = -.03
 MIN_PITCH_DIFF = 1
+OVERWRITE_MIN_PITCH_DIFF = 2
 MAIN_VOICE_THRU = True
 N_HARMONICS = 60
 DO_SWIPE = False
-EXPRESSION_SWIFT = 300000
+EXPRESSION_SWIFT = 1000000
 DO_PROFILE = False
 PEDAL_DELAY = .4
-
-WRITE_FILE = None
-WRITE_FILE = f'free_{random.randint(0, 99999)}.wav'
+# WRITE_FILE = None
+WRITE_FILE = f'demo_{random.randint(0, 99999)}.wav'
 REALTIME_FEEDBACK = True
 
 MASTER_VOLUME = .1
@@ -119,7 +118,8 @@ def main():
             else:
                 if op == PEDAL_DOWN:
                     sustaining = True
-                    last_pedal = time() + .7
+                    # last_pedal = time() + .5
+                    last_pedal = time()
                     print('Pedal down!')
     except KeyboardInterrupt:
         print('Ctrl+C received. Shutting down. ')
@@ -163,6 +163,7 @@ def onAudioIn(in_data, sample_count, *_):
             in_data, dtype = DTYPE[0]
         )
         expression = calcExpression(page)
+        # print(expression)
 
         consume(page)
 
@@ -238,7 +239,7 @@ def consume(page):
             print('Tone goes!', go_pitch)
             tones[-1].go()
             for i, tone in enumerate(tones[:-1]):
-                if abs(tone.pitch - go_pitch) < MIN_PITCH_DIFF:
+                if abs(tone.pitch - go_pitch) < OVERWRITE_MIN_PITCH_DIFF:
                     out_tones.append(tones.pop(i))
         else:
             if stability >= tones[-1].stability:
