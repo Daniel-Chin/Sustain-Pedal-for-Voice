@@ -175,9 +175,14 @@ def consume(page, hanned_page):
             tones.append(Tone(pitch, stability, stm_page))
     else:
         # last tone not going yet
-        if abs(pitch - tones[-1].pitch) > MIN_PITCH_DIFF:
-            print('Tone goes!')
+        go_pitch = tones[-1].pitch
+        if abs(pitch - go_pitch) > MIN_PITCH_DIFF:
+            # print('Tone goes!', np.exp(go_pitch * 0.05776226504666211))
+            print('Tone goes!', go_pitch)
             tones[-1].go()
+            for i, tone in enumerate(tones[:-1]):
+                if abs(tone.pitch - go_pitch) < MIN_PITCH_DIFF:
+                    tones.pop(i)
         else:
             if stability >= tones[-1].stability:
                 print('Better tone, stability', stability)
