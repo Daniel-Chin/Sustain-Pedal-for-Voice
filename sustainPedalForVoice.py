@@ -20,16 +20,19 @@ except ImportError as e:
 
 print('Preparing...')
 PAGE_LEN = 1024
-EXAMPLE_N_PAGE = 12
-STABILITY_THRESHOLD = -.2
+TRACK_N_PAGE = 6
+EXAMPLE_N_PAGE = 4
+# STABILITY_THRESHOLD = -.3
+STABILITY_THRESHOLD = -.02
 MIN_PITCH_DIFF = 1
-MAIN_VOICE_THRU = True
+MAIN_VOICE_THRU = False
 N_HARMONICS = 60
 DO_SWIPE = False
 
 WRITE_FILE = None
 # import random
 # WRITE_FILE = f'demo.wav'
+DO_PROFILE = False
 
 PEDAL_DOWN = b'l'
 PEDAL_UP = b'p'
@@ -41,16 +44,29 @@ SILENCE = np.zeros((PAGE_LEN, ))
 PAGE_TIME = 1 / SR * PAGE_LEN
 LONG_PAGE_LEN = PAGE_LEN * EXAMPLE_N_PAGE
 LONG_IMAGINARY_LADDER = np.linspace(0, TWO_PI * 1j, LONG_PAGE_LEN)
+LONG_HANN = scipy.signal.get_window('hann', LONG_PAGE_LEN, True)
 
 streamOutContainer = []
 terminate_flag = 0
 terminateLock = Lock()
 tones = []
-profiler = StreamProfiler(PAGE_LEN / SR)
+profiler = StreamProfiler(PAGE_LEN / SR, DO_PROFILE)
 sustaining = False  # So don't put a lock if you dont need it
 stm_pitch = []
 stm_page = []
-# Short Term Memory. Len is EXAMPLE_N_PAGE
+# Short Term Memory. Len is TRACK_N_PAGE
+
+def summarize(list_pitch):
+    pitches = np.array(list_pitch)
+    # slope, _, __, ___, _ = stats.linregress(np.arange(pitches.size), pitches)
+    # return np.mean(pitches), - abs(slope) / PAGE_TIME
+    return np.mean(pitches), - np.var(pitches, ddof = 1)
+
+if DO_PROFILE:
+    _print = print
+    def print(*a, **k):
+        _print()
+        _print(*a, **k)
 
 def sft(signal, freq_bin):
     # Slow Fourier Transform
@@ -99,14 +115,8 @@ def main():
         pa.terminate()
         print('Resources released. ')
 
-def summarize(list_pitch):
-    pitches = np.array(list_pitch)
-    slope, _, __, ___, _ = stats.linregress(np.arange(pitches.size), pitches)
-    return np.mean(pitches), - abs(slope) / PAGE_TIME
-    # return np.mean(pitches), np.var(pitches, ddof = 1)
-
 def onAudioIn(in_data, sample_count, *_):
-    global display_time, time_start, terminate_flag
+    global terminate_flag
 
     try:
         if terminate_flag == 1:
@@ -124,10 +134,8 @@ def onAudioIn(in_data, sample_count, *_):
         page = np.frombuffer(
             in_data, dtype = DTYPE[0]
         )
-        hanned_page = HANN * page
 
-        profiler.gonna('consume')
-        consume(page, hanned_page)
+        consume(page)
 
         profiler.gonna('eat')
         [t.loop() for t in tones]
@@ -151,28 +159,33 @@ def onAudioIn(in_data, sample_count, *_):
         traceback.print_exc()
         return (None, pyaudio.paAbort)
 
-def consume(page, hanned_page):
+def consume(page):
     if not sustaining:
         stm_page.clear()
         stm_pitch.clear()
-    f0 = yin(page, SR, PAGE_LEN)
+    profiler.gonna('yin')
+    f0 = yin(page * HANN, SR, PAGE_LEN)
     # fresh_pitch = np.log(f0) * 17.312340490667562 - 36.37631656229591
     fresh_pitch = np.log(f0) * 17.312340490667562
     stm_pitch.append(fresh_pitch)
     stm_page.append(page)
-    if len(stm_pitch) < EXAMPLE_N_PAGE:
+    if len(stm_pitch) < TRACK_N_PAGE:
         tones.clear()
         return
-    if len(stm_pitch) == EXAMPLE_N_PAGE + 1:
+    if len(stm_pitch) == TRACK_N_PAGE + 1:
         stm_pitch.pop(0)
         stm_page.pop(0)
+    profiler.gonna('summ')
     pitch, stability = summarize(stm_pitch)
+    # print(fresh_pitch, pitch)
     # print(stability)
     if not tones or tones[-1].do_go:
         # ready for a new tone
         if stability > STABILITY_THRESHOLD:
-            print('New tone, stability', stability)
-            tones.append(Tone(pitch, stability, stm_page))
+            freq = np.exp(pitch * 0.05776226504666211)
+            if freq > 50 and freq < 1600:
+                print('New tone, stability', stability)
+                tones.append(Tone(pitch, stability, stm_page))
     else:
         # last tone not going yet
         go_pitch = tones[-1].pitch
@@ -197,24 +210,27 @@ class Tone(HarmonicSynth):
         self.do_go = False
         self.pitch = pitch
         self.stability = stability
-        self.imitate(pitch, pages)
+        self.imitate(pitch, pages[:EXAMPLE_N_PAGE])
 
     def imitate(self, pitch, pages):
+        profiler.gonna('concat')
         freq = np.exp(pitch * 0.05776226504666211)
         long_page = np.concatenate(pages)
         self.ground_harmonics = [
             Harmonic(freq * i, 0)
             for i in range(1, 1 + N_HARMONICS)
         ]
+        profiler.gonna('sft')
         self.planned_harmonics = [
             Harmonic(
                 f, 
-                sft(long_page, f * LONG_PAGE_LEN / SR), 
+                sft(long_page * LONG_HANN, f * LONG_PAGE_LEN / SR), 
             )
-            for f in self.ground_harmonics
+            for f, _ in self.ground_harmonics
         ]
     
     def go(self):
+        profiler.gonna('go')
         self.do_go = True
         self.eat(self.ground_harmonics)
     
