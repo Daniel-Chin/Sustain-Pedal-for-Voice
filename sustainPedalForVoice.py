@@ -30,14 +30,15 @@ MIN_PITCH_DIFF = 1
 MAIN_VOICE_THRU = True
 N_HARMONICS = 60
 DO_SWIPE = False
-EXPRESSION_SWIFT = 10000000
+EXPRESSION_SWIFT = 300000
 DO_PROFILE = False
 PEDAL_DELAY = .4
 
-# WRITE_FILE = None
-# WRITE_FILE = f'bohe_{random.randint(0, 99999)}.wav'
+WRITE_FILE = None
+WRITE_FILE = f'free_{random.randint(0, 99999)}.wav'
 REALTIME_FEEDBACK = True
 
+MASTER_VOLUME = .1
 PEDAL_DOWN = b'l'
 # PEDAL_UP = b'p'
 SR = 22050
@@ -55,6 +56,7 @@ streamOutContainer = []
 terminate_flag = 0
 terminateLock = Lock()
 tones = []
+out_tones = []
 profiler = StreamProfiler(PAGE_LEN / SR, DO_PROFILE)
 sustaining = False  # So don't put a lock if you dont need it
 stm_pitch = []
@@ -166,16 +168,23 @@ def onAudioIn(in_data, sample_count, *_):
 
         profiler.gonna('eat')
         [t.eatPlan() for t in tones]
+        [t.eatPlan() for t in out_tones]
 
         profiler.gonna('update')
         [t.update(expression) for t in tones]
+        [t.update(0) for t in out_tones]
+        for i, t in reversed([*enumerate(out_tones)]):
+            if t.scale == 0:
+                out_tones.pop(i)
+            else:
+                t.update(0)
 
         profiler.gonna('mix')
-        to_mix = [t.mix() for t in tones]
+        to_mix = [t.mix() for t in [*tones, *out_tones]]
         if MAIN_VOICE_THRU:
             to_mix.append(page)
         if to_mix:
-            mixed = np.sum(to_mix, 0)
+            mixed = np.round(np.sum(to_mix, 0) * MASTER_VOLUME).astype(DTYPE[0])
         else:
             mixed = SILENCE
         if REALTIME_FEEDBACK:
@@ -203,7 +212,9 @@ def consume(page):
     stm_pitch.append(fresh_pitch)
     stm_page.append(page)
     if len(stm_pitch) < TRACK_N_PAGE:
-        tones.clear()
+        if tones:
+            out_tones.extend(tones)
+            tones.clear()
         return
     if len(stm_pitch) == TRACK_N_PAGE + 1:
         stm_pitch.pop(0)
@@ -228,7 +239,7 @@ def consume(page):
             tones[-1].go()
             for i, tone in enumerate(tones[:-1]):
                 if abs(tone.pitch - go_pitch) < MIN_PITCH_DIFF:
-                    tones.pop(i)
+                    out_tones.append(tones.pop(i))
         else:
             if stability >= tones[-1].stability:
                 print('Better tone, stability', stability)
