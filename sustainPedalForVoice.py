@@ -7,6 +7,7 @@ from scipy import stats
 from threading import Lock
 from collections import namedtuple
 import wave
+import random
 try:
     from interactive import listen
     from yin import yin
@@ -29,13 +30,12 @@ MIN_PITCH_DIFF = 1
 MAIN_VOICE_THRU = True
 N_HARMONICS = 60
 DO_SWIPE = False
-FADE_IN = .1    # seconds
-DO_PROFILE = True
+EXPRESSION_SWIFT = 10000000
+DO_PROFILE = False
 PEDAL_DELAY = .4
 
 # WRITE_FILE = None
-import random
-WRITE_FILE = f'bohe_{random.randint(0, 99999)}.wav'
+# WRITE_FILE = f'bohe_{random.randint(0, 99999)}.wav'
 REALTIME_FEEDBACK = True
 
 PEDAL_DOWN = b'l'
@@ -49,7 +49,7 @@ PAGE_TIME = 1 / SR * PAGE_LEN
 LONG_PAGE_LEN = PAGE_LEN * EXAMPLE_N_PAGE
 LONG_IMAGINARY_LADDER = np.linspace(0, TWO_PI * 1j, LONG_PAGE_LEN)
 LONG_HANN = scipy.signal.get_window('hann', LONG_PAGE_LEN, True)
-FADE_IN_PER_PAGE = PAGE_TIME / FADE_IN
+E_SWIFT_PER_PAGE = PAGE_TIME * EXPRESSION_SWIFT
 
 streamOutContainer = []
 terminate_flag = 0
@@ -138,6 +138,9 @@ def main():
         pa.terminate()
         print('Resources released. ')
 
+def calcExpression(page):
+    return np.sqrt(np.sum(scipy.signal.periodogram(page, SR)[1]) / page.size)
+
 def onAudioIn(in_data, sample_count, *_):
     global terminate_flag
 
@@ -153,15 +156,19 @@ def onAudioIn(in_data, sample_count, *_):
             print('Discarding audio page!')
             in_data = in_data[-PAGE_LEN:]
 
-        profiler.gonna('hann')
+        profiler.gonna('power')
         page = np.frombuffer(
             in_data, dtype = DTYPE[0]
         )
+        expression = calcExpression(page)
 
         consume(page)
 
         profiler.gonna('eat')
-        [t.loop() for t in tones]
+        [t.eatPlan() for t in tones]
+
+        profiler.gonna('update')
+        [t.update(expression) for t in tones]
 
         profiler.gonna('mix')
         to_mix = [t.mix() for t in tones]
@@ -236,37 +243,55 @@ class Tone(HarmonicSynth):
         self.do_go = False
         self.pitch = pitch
         self.stability = stability
-        self.imitate(pitch, pages[:EXAMPLE_N_PAGE])
-        self.master_volume = 0
+        self.scale = 0
+        self.original_expression = None
+        self.example = pages[:EXAMPLE_N_PAGE]
 
-    def imitate(self, pitch, pages):
+    def imitate(self):
         profiler.gonna('concat')
-        freq = np.exp(pitch * 0.05776226504666211)
-        long_page = np.concatenate(pages)
-        self.ground_harmonics = [
-            Harmonic(freq * i, 0)
-            for i in range(1, 1 + N_HARMONICS)
-        ]
+        freq = np.exp(self.pitch * 0.05776226504666211)
+        long_page = np.concatenate(self.example)
         profiler.gonna('sft')
         self.planned_harmonics = [
             Harmonic(
-                f, 
-                sft(long_page * LONG_HANN, f * LONG_PAGE_LEN / SR), 
+                freq * i, 
+                sft(long_page * LONG_HANN, freq * i * LONG_PAGE_LEN / SR), 
             )
-            for f, _ in self.ground_harmonics
+            for i in range(1, 1 + N_HARMONICS)
         ]
     
     def go(self):
+        self.imitate()
         profiler.gonna('go')
         self.do_go = True
-        self.loop()
-    
-    def loop(self):
+        self.scale = 1
+        self.eatPlan()
+        self.eatPlan()
+        self.original_expression = calcExpression(self.mix())
+        # print(self.original_expression)
+        self.scale = 0
+        self.eatPlan()
+
+    def eatPlan(self):
         if self.do_go:
             self.eat([
-                Harmonic(f, m * self.master_volume) 
+                Harmonic(f, m * self.scale) 
                 for f, m in self.planned_harmonics
             ])
-            self.master_volume = min(self.master_volume + FADE_IN_PER_PAGE, 1)
+
+    def update(self, target_expression):
+        if self.do_go:
+            now_expression = self.original_expression * self.scale
+            if target_expression > now_expression:
+                self.scale = min(
+                    now_expression + E_SWIFT_PER_PAGE, 
+                    target_expression, 
+                ) / self.original_expression
+            if target_expression < now_expression:
+                self.scale = max(
+                    now_expression - E_SWIFT_PER_PAGE, 
+                    target_expression, 
+                ) / self.original_expression
+            # print(self.scale)
 
 main()
